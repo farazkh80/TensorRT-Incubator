@@ -16,8 +16,8 @@
 #
 
 import functools
-from collections import deque
 import numbers
+from collections import deque
 from typing import List, Optional, Sequence, Tuple, Union
 
 from tripy import utils
@@ -50,8 +50,6 @@ def _add_column_info_for_non_tensor(
     # Also save the last dispatch target we see.
     dispatch_target = None
     for idx, source_info in enumerate(arg.stack_info[WRAPPER_STACK_DEPTH + skip_num_stack_entries :]):
-        import tripy.function_registry
-
         dispatch_target = source_info._dispatch_target or dispatch_target
         if source_info.module not in utils.get_module_names_to_exclude_from_stack_info():
             frame_index = idx + WRAPPER_STACK_DEPTH + skip_num_stack_entries
