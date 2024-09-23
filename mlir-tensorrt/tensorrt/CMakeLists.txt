@@ -78,5 +78,5 @@ add_definitions(${LLVM_DEFINITIONS})
 
 add_subdirectory(include/mlir-tensorrt-dialect)
 add_subdirectory(lib)
-add_subdirectory(tensorrt-opt)
 add_subdirectory(test)
+add_subdirectory(tensorrt-opt)
