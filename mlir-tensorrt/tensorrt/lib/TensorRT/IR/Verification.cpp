@@ -974,11 +974,14 @@ LogicalResult tensorrt::ResizeLinearOp::verify() {
 
   auto outputRank = outputType.getRank();
   const int64_t resizeDim = std::min(static_cast<int64_t>(3), outputRank);
-  for (int64_t i = outputRank - 1; i >= 0; --i)
+  for (int64_t i = outputRank - 1; i >= 0; --i) {
+    if (inputType.isDynamicDim(i) || outputType.isDynamicDim(i))
+      continue;
     if (inputType.getDimSize(i) != outputType.getDimSize(i))
       if (outputRank - i > resizeDim)
         return emitOpError("only supports resizing on the innermost min(3, "
                            "rank(input)) dimensions");
+  }
 
   if (getScales().has_value()) {
     if (static_cast<int64_t>(getScales().value().size()) != outputRank)
@@ -988,17 +991,6 @@ LogicalResult tensorrt::ResizeLinearOp::verify() {
       if (getScales().value()[i] != 1)
         return emitOpError(
             "all scale values except innermost min(3, rank(input)) must be 1");
-  }
-
-  for (int64_t i = 0; i < resizeDim; ++i) {
-    if (inputType.isDynamicDim(outputRank - 1 - i) ||
-        inputType.isDynamicDim(outputRank - 1 - i)) {
-      if (!getScales().has_value())
-        return emitOpError(
-            "output innermost min(3, rank(input)) dimension that resize on "
-            "cannot be dynamic when resize scales parameter is NOT "
-            "specified");
-    }
   }
   // ResizeLinearOp impl end
   return success();

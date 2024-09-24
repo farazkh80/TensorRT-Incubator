@@ -3450,7 +3450,9 @@ def TensorRT_ResizeLinearOp : TensorRT_Op<"resize_linear", [Pure,
   let hasVerifier = 1;
   let trtLayerAdd = [{
     nvinfer1::IResizeLayer *layer = network->addResize(*$input);
-    if ($op.getScales().has_value())
+    if ($op.getOutputShape())
+      layer->setInput(1, *$output_shape);
+    else if ($op.getScales().has_value())
       layer->setScales($scales.value().begin(), $scales.value().size());
     else
       layer->setOutputDimensions(getNvInferDims($op.getType().getShape()));
