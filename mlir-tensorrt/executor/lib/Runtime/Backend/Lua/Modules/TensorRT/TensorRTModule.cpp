@@ -74,17 +74,17 @@ static StdioLogger logger(/*verbose=*/false);
 //===----------------------------------------------------------------------===//
 namespace {
 struct Signature {
-  unsigned numArguments;
-  unsigned numResults;
+  unsigned numInputArguments;
+  unsigned numOutputArguments;
 
   explicit Signature(const nvinfer1::ICudaEngine *e)
-      : numArguments(0), numResults(0) {
+      : numInputArguments(0), numOutputArguments(0) {
     for (int32_t i = 0; i < e->getNbIOTensors(); i++) {
       const char *name = e->getIOTensorName(i);
       if (e->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
-        numArguments++;
+        numInputArguments++;
       else
-        numResults++;
+        numOutputArguments++;
     }
   }
 };
@@ -109,6 +109,46 @@ public:
   std::shared_ptr<nvinfer1::IRuntime> runtime;
   std::shared_ptr<nvinfer1::ICudaEngine> engine;
 };
+
+
+class TensorRTCallBackOutputAllocator final
+    : public nvinfer1::IOutputAllocator {
+public:
+  TensorRTCallBackOutputAllocator(OutputAllocator *outputAllocator,
+                                  const char *name)
+      : nvinfer1::IOutputAllocator(),
+        mOutputAllocatorCallBack(outputAllocator) {
+    mOutputAllocatorCallBack->setTensorName(name);
+  }
+
+  void *reallocateOutput(char const *tensorName, void *currentMemory,
+                         uint64_t size, uint64_t alignment) noexcept override {
+    return mOutputAllocatorCallBack->reallocateOutputAsync(
+        tensorName, currentMemory, size, alignment, {});
+  }
+
+  //! IMirroredBuffer does not implement Async allocation, hence this is just a
+  //! wrap around
+  void *reallocateOutputAsync(char const *tensorName, void *currentMemory,
+                              uint64_t size, uint64_t alignment,
+                              cudaStream_t stream) noexcept override {
+
+    return mOutputAllocatorCallBack->reallocateOutputAsync(
+        tensorName, currentMemory, size, alignment,
+        reinterpret_cast<CudaStream>(stream));
+  }
+
+  void notifyShape(char const *tensorName,
+                   nvinfer1::Dims const &dims) noexcept override {
+    return mOutputAllocatorCallBack->notifyShape(tensorName, &dims.d[0], dims.nbDims);
+  }
+
+  ~TensorRTCallBackOutputAllocator() override {}
+
+private:
+  OutputAllocator *mOutputAllocatorCallBack;
+};
+
 
 class NvInferExecContextWrapper {
 private:
@@ -184,6 +224,17 @@ public:
   /// Returned the pre-allocated host staging buffers.
   std::vector<PinnedMemoryBlock> &getHostIOBuffers() { return hostIOBuffers; }
 
+  /// Add a call back output allocator.
+  void addCallBackAllocators(
+      std::unique_ptr<TensorRTCallBackOutputAllocator> allocator) {
+    outputAllocators.emplace_back(std::move(allocator));
+  }
+
+  /// Return the last call back output allocator pointer.
+  TensorRTCallBackOutputAllocator *getLastCallBackAllocatorPtr() {
+    return outputAllocators.back().get();
+  }
+
 private:
   // We keep a reference to the cuda engine to keep it from going out of scope.
   // The standard TensorRTRuntime-to-Executor lowering only creates globals for
@@ -197,6 +248,8 @@ private:
   /// A set of pinned host buffers one per input host buffer (shape tensor) to
   /// the TRT network.
   std::vector<PinnedMemoryBlock> hostIOBuffers;
+
+  std::vector<std::unique_ptr<TensorRTCallBackOutputAllocator>> outputAllocators;
 };
 } // namespace
 
@@ -233,7 +286,7 @@ static Status setTensorAddressesOrReport(
       return getStatusWithMsg(StatusCode::InternalError, ss.str());
     }
 
-    if (idx < context.getSignature().numArguments) {
+    if (idx < context.getSignature().numInputArguments) {
       result = context->setInputShape(name.c_str(), dims);
       if (!result)
         return getInternalErrorStatus("failed to set input shape");
@@ -250,14 +303,16 @@ static Status setTensorAddressesOrReport(
 static StatusOr<std::vector<std::tuple<std::string, uintptr_t, nvinfer1::Dims>>>
 prepareBuffers(const AllocTracker &allocTracker,
                NvInferExecContextWrapper &context, CudaStreamPtr stream,
-               sol::table &va) {
+               sol::table &va, bool hasResults) {
   ADD_TENSORRT_MODULE_RANGE("prepare_buffers");
   std::vector<std::tuple<std::string, uintptr_t, nvinfer1::Dims>> result;
   const Signature &sig = context.getSignature();
   unsigned argumentBuffersIdx = 1;
   // The number of arguments should be equal to the number of results plus the
   // number of arguments of the TensorRT engine's functional signature.
-  const unsigned numOperands = sig.numResults + sig.numArguments;
+  const unsigned numOperands =
+      sig.numInputArguments + (!hasResults ? sig.numOutputArguments : 0);
+
   result.reserve(va.size() / 3);
   std::vector<PinnedMemoryBlock> &hostBuffers = context.getHostIOBuffers();
   unsigned hostBufferIdx = 0;
@@ -266,8 +321,8 @@ prepareBuffers(const AllocTracker &allocTracker,
     // compiler.
     /// TODO: make this less hacky.
     std::string name =
-        (i < sig.numArguments ? "arg" : "result") +
-        std::to_string(i >= sig.numArguments ? i - sig.numArguments : i);
+        (i < sig.numInputArguments ? "arg" : "result") +
+        std::to_string(i >= sig.numInputArguments ? i - sig.numInputArguments : i);
 
     // Parse the arguments: ptr, offset, rank, shape...
     uintptr_t ptr = va.get<uintptr_t>(argumentBuffersIdx++);
@@ -278,6 +333,9 @@ prepareBuffers(const AllocTracker &allocTracker,
     dims.nbDims = rank;
     for (int64_t dimIdx = 0; dimIdx < rank; dimIdx++)
       dims.d[dimIdx] = va.get<int64_t>(argumentBuffersIdx++);
+
+    // Skip the over the stride information.
+    argumentBuffersIdx += rank;
 
     uintptr_t pointer = buffer.ptr + offset;
     MTRT_DBGF("enqueue arg %u ptr=0x%lx offset=%ld", i, buffer.ptr, offset);
@@ -341,10 +399,13 @@ prepareBuffers(const AllocTracker &allocTracker,
 
 static Status enqueueV3Wrapper(AllocTracker &tracker,
                                ResourceTracker &resourceTracker,
+                               OutputAllocatorTracker &outputAllocatorTracker,
                                NvInferExecContextWrapper &context,
-                               CudaStreamPtr stream, sol::table &va) {
+                               CudaStreamPtr stream, sol::table &va, std::optional<uintptr_t> outputDescriptors = {}) {
+  bool hasResults = outputDescriptors && *outputDescriptors;
+
   StatusOr<std::vector<std::tuple<std::string, uintptr_t, nvinfer1::Dims>>>
-      buffers = prepareBuffers(tracker, context, stream, va);
+      buffers = prepareBuffers(tracker, context, stream, va, hasResults);
   if (!buffers.isOk())
     return getStatusWithMsg(StatusCode::InternalError,
                             "failed to prepare buffers: ", buffers.getString());
@@ -360,6 +421,25 @@ static Status enqueueV3Wrapper(AllocTracker &tracker,
     return getStatusWithMsg(StatusCode::InternalError,
                             "failed to set input-consumed event");
 
+  if (hasResults) {
+    int64_t* desc = reinterpret_cast<int64_t*>(*outputDescriptors);
+
+    // Number of results are known in advance.
+    int64_t nbResults = desc[0];
+
+    // For each result, set output allocator
+    for (int64_t i = 0; i < nbResults; ++i) {
+      std::string name = "result" + std::to_string(i);
+      context.addCallBackAllocators(
+          std::make_unique<TensorRTCallBackOutputAllocator>(
+              outputAllocatorTracker.get(i), name.c_str()));
+      // Register an output allocator. `enqueueV3` callback should set output
+      // pointer, and notify shapes.
+      context->setOutputAllocator(name.c_str(),
+                                  context.getLastCallBackAllocatorPtr());
+    }
+  }
+
   if (!context->enqueueV3(stream))
     return getStatusWithMsg(StatusCode::InternalError,
                             "failed to enqueue engine execution on stream");
@@ -369,6 +449,27 @@ static Status enqueueV3Wrapper(AllocTracker &tracker,
 
   MTRT_DBGF("%s", "enqueueV3 successful and inputs are consumed");
 
+  if (hasResults) {
+    int64_t* desc = reinterpret_cast<int64_t*>(*outputDescriptors);
+
+    // Number of results are known in advance.
+    int64_t descIndex = 0;
+    int64_t nbResults = desc[descIndex++];
+    for (int64_t i = 0; i < nbResults; ++i) {
+      auto allocator = static_cast<CustomTensorRTOuputAllocator *>(
+          outputAllocatorTracker.get(i));
+      desc[descIndex++] = allocator->mOutputDims.size(); // rank
+      desc[descIndex++] =
+          reinterpret_cast<uintptr_t>(allocator->mOutputPtr); // output pointer
+      std::copy_n(allocator->mOutputDims.data(), allocator->mOutputDims.size(),
+                  desc + descIndex); // Copy input shape
+      descIndex += allocator->mOutputDims.size();
+      std::vector<int64_t> strides(allocator->mOutputDims.size(), 1); // For now, use 1 strides.
+      std::copy_n(strides.data(), strides.size(),
+                  desc + descIndex); // Copy input stride
+    }
+  }
+
   return getOkStatus();
 }
 
@@ -377,7 +478,7 @@ static Status enqueueV3Wrapper(AllocTracker &tracker,
 //===----------------------------------------------------------------------===//
 void mlirtrt::runtime::registerExecutorTensorRTModuleLuaRuntimeMethods(
     lua_State *luaState, PinnedMemoryAllocator *pinnedMemoryAllocator,
-    AllocTracker *allocTracker, ResourceTracker *resourceTracker) {
+    AllocTracker *allocTracker, ResourceTracker *resourceTracker, OutputAllocatorTracker *outputAllocatorTracker) {
   sol::state_view lua(luaState);
 
   lua["_trtrt_create_runtime"] = [](sol::this_state state) {
@@ -417,16 +518,33 @@ void mlirtrt::runtime::registerExecutorTensorRTModuleLuaRuntimeMethods(
   };
 
   lua["_trtrt_enqueue"] =
-      [allocTracker,
-       resourceTracker](sol::this_state state,
-                        std::shared_ptr<NvInferExecContextWrapper> context,
-                        CudaStreamPtr stream, sol::table va) {
+      [allocTracker, resourceTracker, outputAllocatorTracker](
+          sol::this_state state,
+          std::shared_ptr<NvInferExecContextWrapper> context,
+          CudaStreamPtr stream, sol::table va) {
         ADD_TENSORRT_MODULE_RANGE("trtrt_enqueue");
         sol::state_view luaState(state);
         assert(context != nullptr);
         assert(stream != nullptr && "expected valid stream");
+        Status result =
+            enqueueV3Wrapper(*allocTracker, *resourceTracker,
+                             *outputAllocatorTracker, *context, stream, va);
+        SET_LUA_ERROR_IF_ERROR(result, state);
+      };
+
+  lua["_trtrt_alloc_enqueue"] =
+      [allocTracker, resourceTracker, outputAllocatorTracker](
+          sol::this_state state,
+          std::shared_ptr<NvInferExecContextWrapper> context,
+          CudaStreamPtr stream, uintptr_t outputDescriptors, sol::table va) {
+        ADD_TENSORRT_MODULE_RANGE("trtrt_alloc_enqueue");
+        sol::state_view luaState(state);
+        assert(context != nullptr);
+        assert(outputDescriptors != 0);
+        assert(stream != nullptr && "expected valid stream");
         Status result = enqueueV3Wrapper(*allocTracker, *resourceTracker,
-                                         *context, stream, va);
+                                         *outputAllocatorTracker, *context,
+                                         stream, va, outputDescriptors);
         SET_LUA_ERROR_IF_ERROR(result, state);
       };
 }

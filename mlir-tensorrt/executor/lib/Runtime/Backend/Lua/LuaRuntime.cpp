@@ -77,7 +77,7 @@ static void registerDefaultDeviceDependentMethods(lua_State *state,
 
 static void registerLuaRuntimeMethodsCommon(
     lua_State *state, PinnedMemoryAllocator *pinnedMemoryAllocator,
-    AllocTracker *allocTracker, ResourceTracker *resourceTracker) {
+    AllocTracker *allocTracker, ResourceTracker *resourceTracker, OutputAllocatorTracker* outputAllocatorTracker) {
   registerExecutorCoreModuleLuaRuntimeMethods(state, pinnedMemoryAllocator,
                                               allocTracker);
 
@@ -93,16 +93,16 @@ static void registerLuaRuntimeMethodsCommon(
 
 #ifdef MLIR_EXECUTOR_ENABLE_TENSORRT
   registerExecutorTensorRTModuleLuaRuntimeMethods(
-      state, pinnedMemoryAllocator, allocTracker, resourceTracker);
+      state, pinnedMemoryAllocator, allocTracker, resourceTracker, outputAllocatorTracker);
 #endif
 }
 
 void mlirtrt::runtime::registerLuaRuntimeMethods(
     lua_State *state, const RuntimeSessionOptions &options,
     PinnedMemoryAllocator *pinnedMemoryAllocator, AllocTracker *allocTracker,
-    ResourceTracker *resourceTracker) {
+    ResourceTracker *resourceTracker, OutputAllocatorTracker* outputAllocatorTracker) {
   registerLuaRuntimeMethodsCommon(state, pinnedMemoryAllocator, allocTracker,
-                                  resourceTracker);
+                                  resourceTracker, outputAllocatorTracker);
 #ifdef MLIR_EXECUTOR_ENABLE_NCCL
   registerExecutorNCCLModuleLuaRuntimeMethods(state, resourceTracker);
   registerDeviceDependentNCCLMethods(state, options.getNumDevices(),
@@ -154,7 +154,7 @@ LuaRuntimeSession::create(RuntimeSessionOptions options,
   registerLuaRuntimeMethods(lua.lua_state(), session->getOptions(),
                             &session->getPinnedMemorAllocator(),
                             &session->getAllocTracker(),
-                            &session->getResourceTracker());
+                            &session->getResourceTracker(), &session->getOutputAllocatorTracker());
 
   // Register user-provided methods.
   if (registerExtraLuaFuncs)
@@ -425,11 +425,11 @@ static Status pushScalarArgument(sol::state_view &lua,
 
 static Status validateArgsTypesAgainstFuncArgs(const RuntimeValue *runArg,
                                                const TypeUnionView &sigArg) {
-  if (sigArg.isa<MemrefTypeView>()) {
+  if (sigArg.isa<MemRefTypeView>()) {
     if (runArg->getKind() != RuntimeValue::Kind::MemRef)
       return getInvalidArgStatus(
           "function expects a memref type but received scalar type");
-    auto view = sigArg.get<MemrefTypeView>();
+    auto view = sigArg.get<MemRefTypeView>();
     auto value = static_cast<const MemRefValue *>(runArg);
 
     if (view.getElementType() != *value->getScalarType())
@@ -502,12 +502,26 @@ static Status validateArgsTypesAgainstFuncArgs(const RuntimeValue *runArg,
   return getOkStatus();
 }
 
+template<typename T>
+T getIthValue(sol::protected_function_result const& pfr, int pfrIndex,
+                        impl::CallingConvention CConv) {
+  if (CConv == CallingConvention::unpacked) {
+    sol::object obj = pfr[0];   // There is a single element, just index it now.
+    assert(obj.is<sol::table>() && "Expected a table for MemRefValue");
+    sol::table memrefTable = obj.as<sol::table>();
+    return memrefTable.get<T>(pfrIndex++);
+  } else {
+    // It is unclear how to handle packed arguments.
+    assert(0 && "Handling of packed results is not implemented yet!");
+  }
+}
+
 StatusOr<llvm::SmallVector<std::unique_ptr<RuntimeValue>>>
 runtime::executeFunctionWithLuaBackend(
     LuaRuntimeSession &session, std::string_view name,
     llvm::ArrayRef<RuntimeValue *> inputArgs,
     llvm::ArrayRef<RuntimeValue *> outputArgs,
-    std::optional<CudaStream> stream) {
+    std::optional<CudaStream> stream, std::optional<RuntimeClient *> client) {
 
   FunctionView meta = session.getExecutable().getFunction(name);
   FunctionSignatureView sig = meta.getSignature();
@@ -519,10 +533,6 @@ runtime::executeFunctionWithLuaBackend(
   if (funcObj.get_type() != sol::type::function)
     return getStatusWithMsg(StatusCode::InternalError, "no function named \"",
                             std::string(name), "\" found");
-
-  if (sig.getNumResults() > 0)
-    return getInvalidArgStatus("functions with {0} results are not supported",
-                               sig.getNumResults());
 
   // Validate the number of arguments against the signature.
   if (sig.getNumOutputArgs() != outputArgs.size())
@@ -584,6 +594,15 @@ runtime::executeFunctionWithLuaBackend(
   if (stream)
     RETURN_STATUS_IF_ERROR(session.setCudaStream(*stream));
 
+  // Create output allocator for each result argument.
+  OutputAllocatorTracker &outputAllocatorTracker =
+      session.getOutputAllocatorTracker();
+  for (unsigned i = 0; i < sig.getNumResults(); ++i) {
+    // Look up output allocator based on result index.
+    outputAllocatorTracker.track(
+        std::make_unique<CustomTensorRTOuputAllocator>());
+  }
+
   // If the number of arguments exceed a particular threshold, then
   // we pass arguments packed into a table, otherwise we pass as arguments.
   sol::protected_function_result result =
@@ -598,5 +617,30 @@ runtime::executeFunctionWithLuaBackend(
                             "\": ", err.what());
   }
 
-  return llvm::SmallVector<std::unique_ptr<RuntimeValue>>{};
+  llvm::SmallVector<std::unique_ptr<RuntimeValue>> results;
+  int index = 1;
+  for (unsigned i = 0; i < sig.getNumResults(); i++) {
+    assert(sig.getResult(i).isa<MemRefTypeView>() && "Result can be only a memref");
+    unsigned rank = sig.getResult(i).get<MemRefTypeView>().getRank();
+    uintptr_t allocPtr =
+        getIthValue<uintptr_t>(result, index++, sig.getCConv());
+    uintptr_t alignedPtr =
+        getIthValue<uintptr_t>(result, index++, sig.getCConv());
+    (void)alignedPtr;
+    int64_t offset = getIthValue<int64_t>(result, index++, sig.getCConv());
+    llvm::SmallVector<int64_t> shape, strides;
+    for (unsigned dim = 0; dim < rank; dim++)
+      shape.push_back(getIthValue<int64_t>(result, index++, sig.getCConv()));
+    for (unsigned dim = 0; dim < rank; dim++)
+      strides.push_back(
+          getIthValue<int64_t>(result, index++, sig.getCConv()));
+
+    assert(client.has_value() && "Runtime client can not be nullptr");
+    MemRefTypeView result = sig.getResult(i).get<MemRefTypeView>();
+    results.emplace_back(std::move(*MemRefValue::create(
+        *client,  result.getAddressSpace(), result.getElementType().getBitWidth(), allocPtr, offset,
+        llvm::ArrayRef<int64_t>(shape), llvm::ArrayRef<int64_t>(strides),
+        (*client)->getDevices()[0].get(), result.getElementType())));
+  }
+  return results;
 }
